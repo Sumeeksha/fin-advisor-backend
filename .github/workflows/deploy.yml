@@ -1,14 +1,13 @@
-name: Deploy Backend to Cloud Run
+name: Build and Deploy to Cloud Run
 
 on:
   push:
     branches:
       - main
 
-env:
-  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-  REGION: us-central1
-  SERVICE_NAME: fin-advisor-backend
+permissions:
+  contents: 'read'
+  id-token: 'write' # Required for Workload Identity Federation
 
 jobs:
   deploy:
@@ -17,30 +16,33 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Google Auth
-        id: auth
+      # 1. Authenticate to Google Cloud using Workload Identity Federation
+      - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
+      # 2. Set up Cloud SDK (gcloud)
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
-      - name: Configure Docker for Artifact Registry
+      # 3. Configure Docker authentication for Artifact Registry
+      - name: Authorize Docker for Artifact Registry
         run: |
           gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
 
-      - name: Build and Push Container
+      # 4. Build and Push Container Image to Artifact Registry
+      - name: Build and Push Docker Image
         run: |
-          IMAGE_TAG="us-central1-docker.pkg.dev/${{ env.PROJECT_ID }}/cloud-run-source-deploy/${{ env.SERVICE_NAME }}:${{ github.sha }}"
+          IMAGE_TAG="us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/cloud-run-source-deploy/fin-advisor-backend:${{ github.sha }}"
           docker build -t $IMAGE_TAG .
           docker push $IMAGE_TAG
-          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
 
+      # 5. Deploy to Google Cloud Run
       - name: Deploy to Cloud Run
         uses: google-github-actions/deploy-cloudrun@v2
         with:
-          service: ${{ env.SERVICE_NAME }}
-          image: ${{ env.IMAGE_TAG }}
-          region: ${{ env.REGION }}
-          flags: '--allow-unauthenticated'
+          service: fin-advisor-backend
+          image: us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/cloud-run-source-deploy/fin-advisor-backend:${{ github.sha }}
+          region: us-central1
