@@ -22,6 +22,7 @@ app = FastAPI(
 origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "https://fin-advisor-ui-87993570672.us-central1.run.app",  # Added your Cloud Run UI domain
     os.getenv("FRONTEND_URL", "http://localhost:3000"),
 ]
 
