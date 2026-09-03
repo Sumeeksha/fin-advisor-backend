@@ -8,7 +8,7 @@ router = APIRouter()
 
 
 @router.get("/{ticker}")
-def indicators(ticker: str, period: str = Query("3M", regex="^(1M|3M|1Y|5Y)$")):
+def indicators(ticker: str, period: str = Query("3M", pattern="^(1M|3M|1Y|5Y)$")):
     """Compute and return all technical indicators for a ticker."""
     df = get_history(ticker.upper(), period)
     if df is None or df.empty:

@@ -31,7 +31,7 @@ def company_info(ticker: str):
 
 
 @router.get("/{ticker}/history")
-def history(ticker: str, period: str = Query("1M", regex="^(1D|1W|1M|3M|1Y|5Y)$")):
+def history(ticker: str, period: str = Query("1M", pattern="^(1D|1W|1M|3M|1Y|5Y)$")):
     """Get OHLCV price history."""
     df = get_history(ticker.upper(), period)
     if df is None or df.empty:

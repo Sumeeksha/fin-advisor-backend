@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
-from routers import stocks, indicators, advice, forecast, news
+from routers import stocks, indicators, advice, forecast, news, insight
 
 load_dotenv()
 
@@ -40,6 +40,7 @@ app.include_router(indicators.router, prefix="/api/indicators", tags=["Indicator
 app.include_router(advice.router, prefix="/api/advice", tags=["Advice"])
 app.include_router(forecast.router, prefix="/api/forecast", tags=["Forecast"])
 app.include_router(news.router, prefix="/api/news", tags=["News"])
+app.include_router(insight.router, prefix="/api/insight", tags=["Insight"])
 
 
 @app.get("/")
