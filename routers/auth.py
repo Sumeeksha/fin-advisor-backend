@@ -292,3 +292,100 @@ async def bigquery_status():
     Check the current status and health of the BigQuery user logging integration.
     """
     return get_bigquery_status()
+
+
+# ── Profile Update ────────────────────────────────────────────────────────────
+
+class UpdateProfileRequest(BaseModel):
+    name: Optional[str] = None
+    current_password: Optional[str] = None
+    new_password: Optional[str] = None
+
+
+@router.patch("/profile")
+async def update_profile(
+    body: UpdateProfileRequest,
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Update the current user's display name and/or password.
+    - Name change: no password required.
+    - Password change: current_password must be correct, new_password >= 6 chars.
+    - Logs the profile update event to BigQuery.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    token = authorization.split(" ")[1]
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    email = payload.get("email", "").lower()
+    user_id = payload.get("sub", "")
+
+    updated_fields = {}
+
+    # ── Name update ───────────────────────────────────────────────────────────
+    if body.name is not None:
+        name_clean = body.name.strip()
+        if not name_clean:
+            raise HTTPException(status_code=400, detail="Name cannot be empty")
+        if email in USERS_DB:
+            USERS_DB[email]["name"] = name_clean
+        updated_fields["name"] = name_clean
+
+    # ── Password update ───────────────────────────────────────────────────────
+    if body.new_password is not None:
+        if len(body.new_password) < 6:
+            raise HTTPException(status_code=400, detail="New password must be at least 6 characters")
+        if not body.current_password:
+            raise HTTPException(status_code=400, detail="Current password is required to set a new password")
+
+        # For email/password accounts verify the current password
+        if email in USERS_DB:
+            if USERS_DB[email]["password_hash"] != hash_password(body.current_password):
+                raise HTTPException(status_code=400, detail="Current password is incorrect")
+            USERS_DB[email]["password_hash"] = hash_password(body.new_password)
+        # Google OAuth accounts don't have a local password
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Password changes are only available for email/password accounts"
+            )
+        updated_fields["password"] = "updated"
+
+    if not updated_fields:
+        raise HTTPException(status_code=400, detail="No changes provided")
+
+    # Log the update to BigQuery
+    log_user_to_bigquery(
+        user_data={"sub": user_id, "email": email, "name": updated_fields.get("name", payload.get("name", ""))},
+        ip_address=None,
+        user_agent=None,
+        auth_provider="profile_update",
+    )
+
+    # Build a fresh token with the updated name
+    new_name = updated_fields.get("name", payload.get("name"))
+    new_token = create_app_token({
+        "sub": user_id,
+        "email": email,
+        "name": new_name,
+        "picture": payload.get("picture", ""),
+    })
+
+    return {
+        "message": "Profile updated successfully",
+        "updated": list(updated_fields.keys()),
+        "access_token": new_token,
+        "user": {
+            "user_id": user_id,
+            "email": email,
+            "name": new_name,
+            "picture": payload.get("picture", ""),
+        },
+    }
