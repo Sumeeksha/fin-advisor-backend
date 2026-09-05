@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+*.json
+!package.json
+gcp-key.json
+*-key.json
+*credentials*.json
+.env
+!.env.example
+*.log

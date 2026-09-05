@@ -11,7 +11,7 @@ from typing import Optional, Dict
 from fastapi import APIRouter, HTTPException, Request, Depends, Header
 from pydantic import BaseModel, EmailStr
 
-from services.bigquery_service import log_user_to_bigquery
+from services.bigquery_service import log_user_to_bigquery, get_bigquery_status
 
 router = APIRouter()
 
@@ -47,6 +47,16 @@ class AuthResponse(BaseModel):
 
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+def get_client_ip(request: Request) -> str:
+    """
+    Extracts client IP. In Cloud Run or reverse-proxy environments,
+    checks the X-Forwarded-For header first.
+    """
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 def create_app_token(user_info: dict) -> str:
     payload = {
@@ -102,7 +112,7 @@ async def google_login(body: GoogleLoginRequest, request: Request):
     if not user_id or not email:
         raise HTTPException(status_code=400, detail="Google token missing required profile fields")
 
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = get_client_ip(request)
     user_agent = request.headers.get("user-agent", "unknown")
 
     log_user_to_bigquery(
@@ -113,7 +123,8 @@ async def google_login(body: GoogleLoginRequest, request: Request):
             "picture": picture
         },
         ip_address=client_ip,
-        user_agent=user_agent
+        user_agent=user_agent,
+        auth_provider="google"
     )
 
     access_token = create_app_token({
@@ -164,7 +175,7 @@ async def register_user(body: RegisterRequest, request: Request):
     }
     USERS_DB[email_clean] = user_record
 
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = get_client_ip(request)
     user_agent = request.headers.get("user-agent", "unknown")
 
     # Log to BigQuery
@@ -176,7 +187,8 @@ async def register_user(body: RegisterRequest, request: Request):
             "picture": ""
         },
         ip_address=client_ip,
-        user_agent=user_agent
+        user_agent=user_agent,
+        auth_provider="registration"
     )
 
     access_token = create_app_token({
@@ -211,7 +223,7 @@ async def email_login(body: LoginRequest, request: Request):
     if user_record["password_hash"] != hash_password(body.password):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = get_client_ip(request)
     user_agent = request.headers.get("user-agent", "unknown")
 
     # Log to BigQuery
@@ -223,7 +235,8 @@ async def email_login(body: LoginRequest, request: Request):
             "picture": user_record.get("picture", "")
         },
         ip_address=client_ip,
-        user_agent=user_agent
+        user_agent=user_agent,
+        auth_provider="email_password"
     )
 
     access_token = create_app_token({
@@ -271,3 +284,11 @@ async def get_current_user(authorization: Optional[str] = Header(None)):
 @router.post("/logout")
 async def logout():
     return {"message": "Successfully logged out"}
+
+
+@router.get("/bigquery/status")
+async def bigquery_status():
+    """
+    Check the current status and health of the BigQuery user logging integration.
+    """
+    return get_bigquery_status()
