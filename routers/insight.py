@@ -64,7 +64,7 @@ def insight(
     llm_insight = get_llm_insight(payload)
 
     # ── Step 4: Assemble UI data contract ────────────────
-    price = quote.get("price", 185.63)
+    price = quote.get("price") or get_quote(ticker.upper()).get("price", 100.0)
     target_12m = round(price * 1.0545, 2)
     stop_loss = round(price * 0.9451, 2)
     acc_low = round(price * 0.965, 2)

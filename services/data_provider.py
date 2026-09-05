@@ -8,6 +8,7 @@ import os
 import time
 import logging
 import random
+import difflib
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 import yfinance as yf
@@ -23,7 +24,6 @@ _history_cache = {}
 _search_cache = {}
 
 # ── Rate limit / block tracking ───────────────
-# Track if Yahoo Finance is rate-limiting us (to fail fast instead of hanging)
 _yfinance_blocked_until = 0.0
 
 FINNHUB_KEY = os.getenv("FINNHUB_API_KEY", "")
@@ -38,6 +38,59 @@ PERIOD_MAP = {
     "1Y": ("1y", "1d"),
     "5Y": ("5y", "1wk"),
 }
+
+# ── Dynamic Runtime In-Memory Name Cache ──────────────────────────────
+# Stores live company names dynamically retrieved from Yahoo Finance API calls
+_dynamic_name_cache: Dict[str, str] = {}
+
+
+def fetch_company_name_from_yahoo(ticker: str) -> Optional[str]:
+    """Dynamically query Yahoo Finance API to resolve full legal company name for any ticker."""
+    ticker_clean = ticker.upper().strip()
+    if ticker_clean in _dynamic_name_cache:
+        return _dynamic_name_cache[ticker_clean]
+
+    # 1. Query Yahoo Finance Search API directly
+    try:
+        url = f"https://query1.finance.yahoo.com/v1/finance/search?q={ticker_clean}&newsCount=0&quotesCount=5"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        resp = requests.get(url, headers=headers, timeout=3)
+        if resp.status_code == 200:
+            quotes = resp.json().get("quotes", [])
+            for q in quotes:
+                if q.get("symbol", "").upper() == ticker_clean:
+                    name = q.get("longname") or q.get("shortname")
+                    if name:
+                        _dynamic_name_cache[ticker_clean] = name
+                        return name
+    except Exception as e:
+        logger.warning(f"Yahoo Search API name fetch failed for {ticker_clean}: {e}")
+
+    # 2. Query yfinance Ticker info API dynamically
+    try:
+        tk = yf.Ticker(ticker_clean)
+        info = tk.info or {}
+        name = info.get("longName") or info.get("shortName")
+        if name:
+            _dynamic_name_cache[ticker_clean] = name
+            return name
+    except Exception as e:
+        logger.warning(f"yfinance info name fetch failed for {ticker_clean}: {e}")
+
+    return None
+
+
+def get_company_name_for_ticker(ticker: str) -> str:
+    """Return official company name for any ticker symbol by calling Yahoo Finance API dynamically."""
+    ticker_clean = ticker.upper().strip()
+    if ticker_clean in _dynamic_name_cache:
+        return _dynamic_name_cache[ticker_clean]
+
+    name = fetch_company_name_from_yahoo(ticker_clean)
+    if name:
+        return name
+
+    return f"{ticker_clean} Corp"
 
 
 def _check_yfinance_blocked() -> bool:
@@ -58,7 +111,6 @@ def get_quote(ticker: str) -> Dict[str, Any]:
     ticker = ticker.upper().strip()
     cache_key = f"quote_{ticker}"
     
-    # Try TTL cache
     if cache_key in _quote_cache:
         cached_val, ts = _quote_cache[cache_key]
         if time.time() - ts < 30:
@@ -66,15 +118,12 @@ def get_quote(ticker: str) -> Dict[str, Any]:
 
     result = None
 
-    # Try yfinance first (unless marked blocked)
     if not _check_yfinance_blocked():
         result = _quote_yfinance(ticker)
 
-    # Try Finnhub if yfinance fails
     if (not result or "error" in result) and FINNHUB_KEY and FINNHUB_KEY != "YOUR_FINNHUB_KEY_HERE":
         result = _quote_finnhub(ticker)
 
-    # Fallback to sandbox mode
     if not result or "error" in result:
         result = _mock_quote(ticker)
 
@@ -94,7 +143,6 @@ def get_history(ticker: str, period: str = "1M") -> pd.DataFrame:
 
     df = None
     
-    # Try yfinance unless marked blocked
     if not _check_yfinance_blocked():
         yf_period, yf_interval = PERIOD_MAP.get(period, ("1mo", "1d"))
         try:
@@ -108,83 +156,81 @@ def get_history(ticker: str, period: str = "1M") -> pd.DataFrame:
             logger.warning(f"yfinance history failed for {ticker}: {e}")
             _mark_yfinance_blocked()
 
-    # Fallback to mock history
     df = _mock_history(ticker, period)
     _history_cache[cache_key] = (df, time.time())
     return df
 
 
 def search_tickers(query: str) -> List[Dict[str, str]]:
-    """Search for ticker symbols matching a query string."""
-    cache_key = f"search_{query.lower()}"
+    """Search for any ticker symbol or company name dynamically via Yahoo Finance Search API."""
+    q_str = query.strip()
+    if not q_str:
+        return []
+
+    cache_key = f"search_{q_str.lower()}"
     if cache_key in _search_cache:
         return _search_cache[cache_key]
 
     results = []
+    seen_symbols = set()
     
-    if not _check_yfinance_blocked():
-        try:
-            url = f"https://query1.finance.yahoo.com/v1/finance/search?q={query}&newsCount=0&quotesCount=10"
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-            resp = requests.get(url, headers=headers, timeout=3)
-            if resp.status_code == 200:
-                data = resp.json()
-                for item in data.get("quotes", [])[:10]:
-                    if item.get("quoteType") in ("EQUITY", "ETF", "MUTUALFUND"):
-                        results.append({
-                            "symbol": item.get("symbol", ""),
-                            "name": item.get("longname") or item.get("shortname", ""),
-                            "type": item.get("quoteType", ""),
-                            "exchange": item.get("exchDisp", ""),
-                        })
-            elif resp.status_code == 429:
-                _mark_yfinance_blocked()
-        except Exception as e:
-            logger.warning(f"Search failed for '{query}': {e}")
-            _mark_yfinance_blocked()
+    # 1. Live Yahoo Finance Search API
+    try:
+        url = f"https://query1.finance.yahoo.com/v1/finance/search?q={q_str}&newsCount=0&quotesCount=10"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        resp = requests.get(url, headers=headers, timeout=3)
+        if resp.status_code == 200:
+            data = resp.json()
+            for item in data.get("quotes", [])[:10]:
+                sym = item.get("symbol", "").upper()
+                if item.get("quoteType") in ("EQUITY", "ETF", "MUTUALFUND") and sym:
+                    official_name = item.get("longname") or item.get("shortname") or sym
+                    _dynamic_name_cache[sym] = official_name  # Cache dynamically from Yahoo response
+                    results.append({
+                        "symbol": sym,
+                        "name": official_name,
+                        "type": item.get("quoteType", ""),
+                        "exchange": item.get("exchDisp", ""),
+                    })
+                    seen_symbols.add(sym)
+    except Exception as e:
+        logger.warning(f"Yahoo Search API error for '{q_str}': {e}")
 
+    # 2. Live Finnhub Search API (Secondary Fallback)
     if not results and FINNHUB_KEY and FINNHUB_KEY != "YOUR_FINNHUB_KEY_HERE":
         try:
-            url = f"https://finnhub.io/api/v1/search?q={query}&token={FINNHUB_KEY}"
+            url = f"https://finnhub.io/api/v1/search?q={q_str}&token={FINNHUB_KEY}"
             resp = requests.get(url, timeout=3)
             if resp.status_code == 200:
                 data = resp.json()
                 for item in data.get("result", [])[:10]:
-                    results.append({
-                        "symbol": item.get("symbol", ""),
-                        "name": item.get("description", ""),
-                        "type": item.get("type", ""),
-                        "exchange": "",
-                    })
+                    sym = item.get("symbol", "").upper()
+                    if sym and sym not in seen_symbols:
+                        official_name = item.get("description", sym)
+                        _dynamic_name_cache[sym] = official_name
+                        results.append({
+                            "symbol": sym,
+                            "name": official_name,
+                            "type": item.get("type", ""),
+                            "exchange": "",
+                        })
+                        seen_symbols.add(sym)
         except Exception as e:
             logger.warning(f"Finnhub search failed: {e}")
 
-    if not results:
-        popular_list = [
-            {"symbol": "AAPL", "name": "Apple Inc.", "type": "EQUITY", "exchange": "NASDAQ"},
-            {"symbol": "TSLA", "name": "Tesla, Inc.", "type": "EQUITY", "exchange": "NASDAQ"},
-            {"symbol": "MSFT", "name": "Microsoft Corporation", "type": "EQUITY", "exchange": "NASDAQ"},
-            {"symbol": "GOOGL", "name": "Alphabet Inc.", "type": "EQUITY", "exchange": "NASDAQ"},
-            {"symbol": "AMZN", "name": "Amazon.com, Inc.", "type": "EQUITY", "exchange": "NASDAQ"},
-            {"symbol": "NVDA", "name": "NVIDIA Corporation", "type": "EQUITY", "exchange": "NASDAQ"},
-            {"symbol": "META", "name": "Meta Platforms, Inc.", "type": "EQUITY", "exchange": "NASDAQ"},
-            {"symbol": "NFLX", "name": "Netflix, Inc.", "type": "EQUITY", "exchange": "NASDAQ"},
-        ]
-        q = query.upper()
-        results = [
-            item for item in popular_list
-            if q in item["symbol"] or q in item["name"].upper()
-        ]
-        if not results and len(query) <= 5 and query.isalpha():
-            results.append({
-                "symbol": q,
-                "name": f"{q} Corporation (Sandbox Mode)",
-                "type": "EQUITY",
-                "exchange": "NASDAQ",
-            })
+    # 3. Dynamic Single Ticker Resolution Fallback
+    if not results and len(q_str) <= 5 and q_str.isalpha():
+        sym_upper = q_str.upper()
+        dyn_name = fetch_company_name_from_yahoo(sym_upper) or f"{sym_upper} Corp"
+        results.append({
+            "symbol": sym_upper,
+            "name": dyn_name,
+            "type": "EQUITY",
+            "exchange": "NASDAQ",
+        })
 
-    _search_cache[cache_key] = results
-    return results
+    _search_cache[cache_key] = results[:10]
+    return results[:10]
 
 
 def get_company_info(ticker: str) -> Dict[str, Any]:
@@ -223,7 +269,7 @@ def get_company_info(ticker: str) -> Dict[str, Any]:
     eps = random.uniform(2, 10)
     base = _get_base_price(ticker)
     return {
-        "name": f"{ticker} Corporation",
+        "name": get_company_name_for_ticker(ticker),
         "sector": "Technology" if ticker in ["AAPL", "NVDA", "MSFT"] else "Automotive" if ticker == "TSLA" else "Financial Services",
         "industry": "Consumer Electronics" if ticker == "AAPL" else "Software" if ticker == "MSFT" else "Internet Content & Information",
         "description": f"This is a sandbox metadata card for {ticker} Corporation. Real-time Yahoo Finance metadata is currently rate-limited, so FinAdvisor has generated this portfolio summary and financial ratios mathematically.",
@@ -342,9 +388,11 @@ def _quote_yfinance(ticker: str) -> Optional[Dict[str, Any]]:
         change = (price - prev_close) if prev_close else 0
         change_pct = (change / prev_close * 100) if prev_close else 0
 
+        official_name = get_company_name_for_ticker(ticker)
+
         return {
             "ticker": ticker.upper(),
-            "name": ticker,
+            "name": official_name,
             "price": round(float(price), 2),
             "prev_close": round(float(prev_close), 2) if prev_close else None,
             "open": round(float(open_price), 2) if open_price else None,
@@ -377,9 +425,10 @@ def _quote_finnhub(ticker: str) -> Optional[Dict[str, Any]]:
             return None
         change = d.get("d", 0)
         change_pct = d.get("dp", 0)
+        official_name = get_company_name_for_ticker(ticker)
         return {
             "ticker": ticker.upper(),
-            "name": ticker,
+            "name": official_name,
             "price": round(float(price), 2),
             "prev_close": round(float(prev_close), 2) if prev_close else None,
             "open": round(float(d.get("o", 0)), 2),
@@ -407,10 +456,11 @@ def _mock_quote(ticker: str) -> Dict[str, Any]:
     price = base * (1 + change_pct / 100)
     prev_close = base
     change = price - prev_close
+    official_name = get_company_name_for_ticker(ticker)
     
     return {
         "ticker": ticker,
-        "name": f"{ticker} Corporation (Sandbox Mode)",
+        "name": official_name,
         "price": round(price, 2),
         "prev_close": round(prev_close, 2),
         "open": round(prev_close * random.uniform(0.99, 1.01), 2),
@@ -487,14 +537,20 @@ def _mock_history(ticker: str, period: str) -> pd.DataFrame:
 
 
 def get_market_ribbon() -> List[Dict[str, Any]]:
-    """Get market index and trending quotes for the top marquee header bar."""
-    indices = [
+    """Get market index and trending quotes dynamically for header marquee."""
+    symbols = ["AAPL", "TSLA", "NVDA", "MSFT", "GOOGL", "AMZN"]
+    ribbon = [
         {"symbol": "^GSPC", "label": "S&P 500", "price": 5117.09, "change_pct": 0.42},
         {"symbol": "^IXIC", "label": "NASDAQ", "price": 16288.36, "change_pct": 0.85},
-        {"symbol": "GOOGL", "label": "GOOGL", "price": 178.35, "change_pct": 1.85},
-        {"symbol": "NVDA", "label": "NVDA", "price": 128.40, "change_pct": 3.20},
-        {"symbol": "AAPL", "label": "AAPL", "price": 185.63, "change_pct": 0.34},
-        {"symbol": "MSFT", "label": "MSFT", "price": 420.15, "change_pct": 0.52},
     ]
-    return indices
+    for sym in symbols:
+        q = get_quote(sym)
+        if q and "price" in q:
+            ribbon.append({
+                "symbol": sym,
+                "label": sym,
+                "price": q["price"],
+                "change_pct": q.get("change_pct", 0.0),
+            })
+    return ribbon
 
