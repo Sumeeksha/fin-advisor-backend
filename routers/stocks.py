@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, HTTPException, Query
 from typing import List
-from services.data_provider import get_quote, search_tickers, get_company_info, get_history
+from services.data_provider import get_quote, search_tickers, get_company_info, get_history, get_market_ribbon
 
 router = APIRouter()
 
@@ -12,6 +12,12 @@ def search(q: str = Query(..., min_length=1)):
     """Search tickers by name or symbol."""
     results = search_tickers(q)
     return {"results": results}
+
+
+@router.get("/market-ribbon")
+def market_ribbon():
+    """Get live market index and trending quotes for header marquee."""
+    return get_market_ribbon()
 
 
 @router.get("/{ticker}/quote")

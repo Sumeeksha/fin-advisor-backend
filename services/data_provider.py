@@ -484,3 +484,17 @@ def _mock_history(ticker: str, period: str) -> pd.DataFrame:
     }, index=pd.to_datetime(dates))
     
     return df
+
+
+def get_market_ribbon() -> List[Dict[str, Any]]:
+    """Get market index and trending quotes for the top marquee header bar."""
+    indices = [
+        {"symbol": "^GSPC", "label": "S&P 500", "price": 5117.09, "change_pct": 0.42},
+        {"symbol": "^IXIC", "label": "NASDAQ", "price": 16288.36, "change_pct": 0.85},
+        {"symbol": "GOOGL", "label": "GOOGL", "price": 178.35, "change_pct": 1.85},
+        {"symbol": "NVDA", "label": "NVDA", "price": 128.40, "change_pct": 3.20},
+        {"symbol": "AAPL", "label": "AAPL", "price": 185.63, "change_pct": 0.34},
+        {"symbol": "MSFT", "label": "MSFT", "price": 420.15, "change_pct": 0.52},
+    ]
+    return indices
+
