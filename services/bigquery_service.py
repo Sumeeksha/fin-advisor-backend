@@ -53,13 +53,16 @@ def _resolve_credentials_path() -> Optional[str]:
     return creds_path
 
 
+_last_init_error: Optional[str] = None
+
+
 def get_bigquery_client():
     """
     Lazy initializer for BigQuery Client.
     Supports GOOGLE_APPLICATION_CREDENTIALS file path, default application credentials,
     and Google Cloud Run environment authentication.
     """
-    global _bigquery_client
+    global _bigquery_client, _last_init_error
     if _bigquery_client is not None:
         return _bigquery_client
 
@@ -75,23 +78,28 @@ def get_bigquery_client():
             credentials = service_account.Credentials.from_service_account_file(resolved_creds)
             target_project = project_id or credentials.project_id
             _bigquery_client = bigquery.Client(credentials=credentials, project=target_project)
-        elif project_id:
-            # Fallback to Application Default Credentials (ADC) or Cloud Run runtime role
-            _bigquery_client = bigquery.Client(project=project_id)
         else:
-            # BigQuery client with standard environment credentials
-            _bigquery_client = bigquery.Client()
+            # If the specified JSON file does NOT exist on disk (e.g. running on Cloud Run),
+            # pop GOOGLE_APPLICATION_CREDENTIALS so Google auth falls back cleanly to
+            # Application Default Credentials (ADC) / Cloud Run metadata service.
+            if "GOOGLE_APPLICATION_CREDENTIALS" in os.environ:
+                os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
+
+            if project_id:
+                _bigquery_client = bigquery.Client(project=project_id)
+            else:
+                _bigquery_client = bigquery.Client()
 
         logger.info(f"Successfully initialized BigQuery client for project '{_bigquery_client.project}'.")
+        _last_init_error = None
         return _bigquery_client
 
     except ImportError:
-        logger.error(
-            "google-cloud-bigquery package is not installed. "
-            "Please run: pip install google-cloud-bigquery"
-        )
+        _last_init_error = "google-cloud-bigquery package is not installed."
+        logger.error(_last_init_error)
         return None
     except Exception as e:
+        _last_init_error = str(e)
         logger.warning(
             f"BigQuery client could not be initialized: {e}. "
             "Login events will be logged to console until GCP credentials are configured."
@@ -257,9 +265,11 @@ def get_bigquery_status() -> Dict[str, Any]:
 
     client = get_bigquery_client()
     if not client:
+        err_detail = f" ({_last_init_error})" if _last_init_error else ""
         status["message"] = (
-            "BigQuery client could not connect. Ensure GCP_PROJECT_ID is valid "
-            "and GOOGLE_APPLICATION_CREDENTIALS points to a valid service account JSON file."
+            f"BigQuery client could not connect{err_detail}. "
+            "On Cloud Run, ensure the service account has 'BigQuery Data Editor' role. "
+            "In local development, provide a valid backend/gcp-key.json file or run: gcloud auth application-default login"
         )
         return status
 
