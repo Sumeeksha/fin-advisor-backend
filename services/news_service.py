@@ -34,7 +34,7 @@ FINNHUB_KEY = os.getenv("FINNHUB_API_KEY", "")
 # ── SEC EDGAR — required User-Agent (SEC blocks anonymous requests) ──────────
 SEC_USER_AGENT = os.getenv(
     "SEC_USER_AGENT",
-    "FinancialAdvisoryApp/1.0 contact@financialadvisoryapp.com",
+    "FinancialAdvisoryApp/1.0 help.finadvisor@gmail.com",
 )
 SEC_HEADERS = {"User-Agent": SEC_USER_AGENT, "Accept-Encoding": "gzip, deflate"}
 
