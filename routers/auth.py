@@ -10,6 +10,7 @@ import jwt
 from typing import Optional, Dict
 from fastapi import APIRouter, HTTPException, Request, Depends, Header
 from pydantic import BaseModel, EmailStr
+from datetime import datetime
 
 from services.bigquery_service import log_user_to_bigquery, get_bigquery_status
 
@@ -29,6 +30,7 @@ class RegisterRequest(BaseModel):
     email: str
     password: str
     name: Optional[str] = None
+    role: Optional[str] = "Beginner"
 
 class LoginRequest(BaseModel):
     email: str
@@ -39,6 +41,8 @@ class UserProfile(BaseModel):
     email: str
     name: Optional[str] = None
     picture: Optional[str] = None
+    role: Optional[str] = "Beginner"
+    created_at: Optional[str] = None
 
 class AuthResponse(BaseModel):
     access_token: str
@@ -64,6 +68,8 @@ def create_app_token(user_info: dict) -> str:
         "email": user_info.get("email"),
         "name": user_info.get("name"),
         "picture": user_info.get("picture"),
+        "role": user_info.get("role", "Beginner"),
+        "created_at": user_info.get("created_at"),
         "exp": int(time.time()) + (24 * 3600)  # 24 hours validity
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
@@ -127,11 +133,25 @@ async def google_login(body: GoogleLoginRequest, request: Request):
         auth_provider="google"
     )
 
+    if email not in USERS_DB:
+        USERS_DB[email] = {
+            "user_id": user_id,
+            "email": email,
+            "name": name,
+            "picture": picture,
+            "role": "Beginner",
+            "created_at": datetime.now().isoformat()
+        }
+    
+    user_record = USERS_DB[email]
+
     access_token = create_app_token({
         "sub": user_id,
         "email": email,
         "name": name,
-        "picture": picture
+        "picture": picture,
+        "role": user_record.get("role", "Beginner"),
+        "created_at": user_record.get("created_at")
     })
 
     return AuthResponse(
@@ -141,7 +161,9 @@ async def google_login(body: GoogleLoginRequest, request: Request):
             user_id=user_id,
             email=email,
             name=name,
-            picture=picture
+            picture=picture,
+            role=user_record.get("role", "Beginner"),
+            created_at=user_record.get("created_at")
         )
     )
 
@@ -171,7 +193,9 @@ async def register_user(body: RegisterRequest, request: Request):
         "email": email_clean,
         "name": name,
         "password_hash": hash_password(body.password),
-        "picture": ""
+        "picture": "",
+        "role": body.role or "Beginner",
+        "created_at": datetime.now().isoformat()
     }
     USERS_DB[email_clean] = user_record
 
@@ -195,7 +219,9 @@ async def register_user(body: RegisterRequest, request: Request):
         "sub": user_id,
         "email": email_clean,
         "name": name,
-        "picture": ""
+        "picture": "",
+        "role": user_record["role"],
+        "created_at": user_record["created_at"]
     })
 
     return AuthResponse(
@@ -205,7 +231,9 @@ async def register_user(body: RegisterRequest, request: Request):
             user_id=user_id,
             email=email_clean,
             name=name,
-            picture=""
+            picture="",
+            role=user_record["role"],
+            created_at=user_record["created_at"]
         )
     )
 
@@ -243,7 +271,9 @@ async def email_login(body: LoginRequest, request: Request):
         "sub": user_record["user_id"],
         "email": email_clean,
         "name": user_record["name"],
-        "picture": user_record.get("picture", "")
+        "picture": user_record.get("picture", ""),
+        "role": user_record.get("role", "Beginner"),
+        "created_at": user_record.get("created_at")
     })
 
     return AuthResponse(
@@ -253,7 +283,9 @@ async def email_login(body: LoginRequest, request: Request):
             user_id=user_record["user_id"],
             email=email_clean,
             name=user_record["name"],
-            picture=user_record.get("picture", "")
+            picture=user_record.get("picture", ""),
+            role=user_record.get("role", "Beginner"),
+            created_at=user_record.get("created_at")
         )
     )
 
@@ -273,7 +305,9 @@ async def get_current_user(authorization: Optional[str] = Header(None)):
             user_id=payload.get("sub", ""),
             email=payload.get("email", ""),
             name=payload.get("name"),
-            picture=payload.get("picture")
+            picture=payload.get("picture"),
+            role=payload.get("role", "Beginner"),
+            created_at=payload.get("created_at")
         )
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token has expired")
@@ -300,6 +334,7 @@ class UpdateProfileRequest(BaseModel):
     name: Optional[str] = None
     current_password: Optional[str] = None
     new_password: Optional[str] = None
+    role: Optional[str] = None
 
 
 @router.patch("/profile")
@@ -338,6 +373,15 @@ async def update_profile(
             USERS_DB[email]["name"] = name_clean
         updated_fields["name"] = name_clean
 
+    # ── Role update ───────────────────────────────────────────────────────────
+    if body.role is not None:
+        role_clean = body.role.strip()
+        if not role_clean:
+            raise HTTPException(status_code=400, detail="Role cannot be empty")
+        if email in USERS_DB:
+            USERS_DB[email]["role"] = role_clean
+        updated_fields["role"] = role_clean
+
     # ── Password update ───────────────────────────────────────────────────────
     if body.new_password is not None:
         if len(body.new_password) < 6:
@@ -369,13 +413,16 @@ async def update_profile(
         auth_provider="profile_update",
     )
 
-    # Build a fresh token with the updated name
+    # Build a fresh token with the updated name and role
     new_name = updated_fields.get("name", payload.get("name"))
+    new_role = updated_fields.get("role", payload.get("role", "Beginner"))
     new_token = create_app_token({
         "sub": user_id,
         "email": email,
         "name": new_name,
         "picture": payload.get("picture", ""),
+        "role": new_role,
+        "created_at": payload.get("created_at")
     })
 
     return {
@@ -387,5 +434,7 @@ async def update_profile(
             "email": email,
             "name": new_name,
             "picture": payload.get("picture", ""),
+            "role": new_role,
+            "created_at": payload.get("created_at")
         },
     }
