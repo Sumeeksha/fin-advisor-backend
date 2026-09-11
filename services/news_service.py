@@ -52,7 +52,7 @@ SEC_TTL  = 1800  # 30 minutes
 class NewsItem:
     id:           str
     type:         str           # "filing" | "news" | "rss"
-    title:        str
+    headline:     str           # matches frontend NewsItem.headline
     summary:      str
     source:       str
     source_logo:  str
@@ -195,7 +195,7 @@ def _fetch_sec_filings(
                 filed_ts  = int(time.time())
                 filed_iso = _ts_to_iso(filed_ts)
 
-            title = (
+            headline = (
                 f"{company_name} — {form}: {desc} ({filed})"
                 if desc else
                 f"{company_name} — {form} ({filed})"
@@ -209,7 +209,7 @@ def _fetch_sec_filings(
             items.append(NewsItem(
                 id=_make_id(f"sec_{form}", direct_url),
                 type="filing",
-                title=title,
+                headline=headline,
                 summary=summary,
                 source="SEC EDGAR",
                 source_logo="https://www.sec.gov/files/sec-logo.png",
@@ -261,7 +261,7 @@ def _fetch_finnhub_news(ticker: str, limit: int = 10) -> List[NewsItem]:
                 items.append(NewsItem(
                     id=_make_id("finnhub", article_url),
                     type="news",
-                    title=raw.get("headline", ""),
+                    headline=raw.get("headline", ""),
                     summary=raw.get("summary", ""),
                     source=raw.get("source", "Finnhub"),
                     source_logo="",
@@ -371,6 +371,16 @@ def _fetch_rss_news(ticker: str, limit: int = 10) -> List[NewsItem]:
         _news_cache[cache_key] = {"ts": time.time(), "data": items}
         return items
 
+    import re
+
+    def _strip_html(text) -> str:
+        """Remove HTML tags and decode common HTML entities. Safe with None input."""
+        text = str(text or "")
+        text = re.sub(r"<[^>]+>", "", text)
+        text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        text = text.replace("&quot;", '"').replace("&#39;", "'")
+        return text.strip()
+
     for feed_url_template, source_name in RSS_FEEDS_TEMPLATE:
         if len(items) >= limit:
             break
@@ -380,12 +390,16 @@ def _fetch_rss_news(ticker: str, limit: int = 10) -> List[NewsItem]:
             for entry in feed.entries:
                 if len(items) >= limit:
                     break
-                article_url = entry.get("link", "")
+                article_url = entry.get("link") or ""
                 if not article_url:
                     continue
 
-                title   = entry.get("title", "")
-                summary = entry.get("summary", "") or entry.get("description", "")
+                raw_title   = entry.get("title") or ""
+                raw_summary = entry.get("summary") or entry.get("description") or ""
+
+                # Strip any HTML tags that RSS feeds (e.g. Google News) may embed
+                title   = _strip_html(raw_title)
+                summary = _strip_html(raw_summary)
 
                 published_parsed = entry.get("published_parsed")
                 ts = calendar.timegm(published_parsed) if published_parsed else int(time.time())
@@ -393,7 +407,7 @@ def _fetch_rss_news(ticker: str, limit: int = 10) -> List[NewsItem]:
                 items.append(NewsItem(
                     id=_make_id("rss", article_url),
                     type="rss",
-                    title=title,
+                    headline=title,
                     summary=summary,
                     source=source_name,
                     source_logo="",
