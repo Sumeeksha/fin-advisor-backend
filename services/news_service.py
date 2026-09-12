@@ -437,6 +437,12 @@ def fetch_all_news(
     """
     Aggregate news and regulatory filings for a ticker from all configured sources.
 
+    Display order (within each group, newest-first):
+      1. Google Finance RSS
+      2. Yahoo Finance RSS
+      3. Finnhub / yfinance news
+      4. SEC EDGAR filings
+
     Args:
         ticker: Stock ticker symbol (e.g. "AAPL")
         types:  Source types to include — any of ["news", "sec", "rss"].
@@ -444,7 +450,7 @@ def fetch_all_news(
         limit:  Maximum total items to return (default 20).
 
     Returns:
-        List of NewsItem dicts, sorted newest-first, deduplicated by URL.
+        List of NewsItem dicts, grouped by source priority then newest-first.
         Every item is guaranteed to have a non-empty canonical URL.
     """
     ticker = ticker.upper().strip()
@@ -453,13 +459,13 @@ def fetch_all_news(
 
     all_items: List[NewsItem] = []
 
-    # 1. SEC EDGAR Filings
-    if "sec" in types:
-        sec_items = _fetch_sec_filings(ticker, form_types=["10-K", "10-Q", "8-K"], limit=10)
-        all_items.extend(sec_items)
-        logger.info(f"[{ticker}] SEC: {len(sec_items)} filings")
+    # 1. RSS feeds — Google Finance first, Yahoo Finance second
+    if "rss" in types:
+        rss_items = _fetch_rss_news(ticker, limit=10)
+        all_items.extend(rss_items)
+        logger.info(f"[{ticker}] RSS: {len(rss_items)} articles")
 
-    # 2. Finnhub news (primary)
+    # 2. Finnhub news (primary market news)
     if "news" in types:
         finnhub_items = _fetch_finnhub_news(ticker, limit=limit)
         all_items.extend(finnhub_items)
@@ -471,11 +477,11 @@ def fetch_all_news(
             all_items.extend(yf_items)
             logger.info(f"[{ticker}] yfinance fallback: {len(yf_items)} articles")
 
-    # 3. RSS feeds
-    if "rss" in types:
-        rss_items = _fetch_rss_news(ticker, limit=10)
-        all_items.extend(rss_items)
-        logger.info(f"[{ticker}] RSS: {len(rss_items)} articles")
+    # 3. SEC EDGAR Filings — shown last
+    if "sec" in types:
+        sec_items = _fetch_sec_filings(ticker, form_types=["10-K", "10-Q", "8-K"], limit=10)
+        all_items.extend(sec_items)
+        logger.info(f"[{ticker}] SEC: {len(sec_items)} filings")
 
     # Deduplicate by URL
     seen_urls: set = set()
@@ -485,8 +491,19 @@ def fetch_all_news(
             seen_urls.add(item.url)
             unique.append(item)
 
-    # Sort newest-first and apply limit
-    unique.sort(key=lambda x: x.published_ts, reverse=True)
+    # Sort by source priority group first, then newest-first within each group.
+    # Priority: Google Finance (0) → Yahoo Finance (1) → market news (2) → SEC EDGAR (3)
+    _source_priority = {
+        "Google Finance": 0,
+        "Yahoo Finance":  1,
+        "SEC EDGAR":      3,
+    }
+
+    def _sort_key(item: NewsItem):
+        priority = _source_priority.get(item.source, 2)  # Finnhub/yfinance → 2
+        return (priority, -item.published_ts)
+
+    unique.sort(key=_sort_key)
     result = [asdict(item) for item in unique[:limit]]
 
     logger.info(f"[{ticker}] Total returned: {len(result)} items (types={types})")
