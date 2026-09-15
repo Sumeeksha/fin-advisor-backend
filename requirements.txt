@@ -17,3 +17,5 @@ pyjwt==2.8.0
 google-cloud-bigquery==3.45.0
 db-dtypes==1.7.1
 feedparser==6.0.11
+tradingview-ta==3.3.0
+tvdatafeed==2.0.2

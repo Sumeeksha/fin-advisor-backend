@@ -58,7 +58,30 @@ def compute_bollinger(
     }
 
 
-def get_all_indicators(df: pd.DataFrame) -> Dict[str, Any]:
+def fetch_tradingview_indicators(ticker: str) -> Optional[Dict[str, Any]]:
+    """Fetch official technical indicators directly from TradingView TA API."""
+    try:
+        from tradingview_ta import TA_Handler, Interval
+        ticker = ticker.upper().strip()
+        for ex in ["NASDAQ", "NYSE", "AMEX", ""]:
+            try:
+                handler = TA_Handler(
+                    symbol=ticker,
+                    exchange=ex,
+                    screener="america",
+                    interval=Interval.INTERVAL_1_DAY
+                )
+                analysis = handler.get_analysis()
+                if analysis and analysis.indicators:
+                    return analysis.indicators
+            except Exception:
+                continue
+    except Exception as e:
+        logger.warning(f"tradingview-ta error for {ticker}: {e}")
+    return None
+
+
+def get_all_indicators(df: pd.DataFrame, ticker: str = "", source: str = "yfinance") -> Dict[str, Any]:
     """Compute all technical indicators and return structured dict."""
     if df is None or df.empty or len(df) < 30:
         return {"error": "Insufficient data to compute indicators"}
@@ -109,7 +132,8 @@ def get_all_indicators(df: pd.DataFrame) -> Dict[str, Any]:
     histogram_history = _series_to_list(macd_data["histogram"].tail(100))
     dates = [str(d.date()) if hasattr(d, "date") else str(d) for d in close.tail(100).index]
 
-    return {
+    # Base result
+    result = {
         "rsi": {
             "current": round(current_rsi, 2) if current_rsi else None,
             "signal": _rsi_signal(current_rsi),
@@ -153,7 +177,39 @@ def get_all_indicators(df: pd.DataFrame) -> Dict[str, Any]:
         },
         "trend": trend,
         "current_price": current_price,
+        "data_source": "yfinance",
     }
+
+    # If TradingView is requested, fetch and merge official TradingView indicators
+    if source.lower() == "tradingview" and ticker:
+        tv_ind = fetch_tradingview_indicators(ticker)
+        if tv_ind:
+            result["data_source"] = "TradingView"
+            if "RSI" in tv_ind and tv_ind["RSI"] is not None:
+                tv_rsi = round(float(tv_ind["RSI"]), 2)
+                result["rsi"]["current"] = tv_rsi
+                result["rsi"]["signal"] = _rsi_signal(tv_rsi)
+
+            if "MACD.macd" in tv_ind and tv_ind["MACD.macd"] is not None:
+                tv_macd = round(float(tv_ind["MACD.macd"]), 4)
+                tv_sig = round(float(tv_ind.get("MACD.signal", 0)), 4)
+                result["macd"]["macd"] = tv_macd
+                result["macd"]["signal"] = tv_sig
+                result["macd"]["histogram"] = round(tv_macd - tv_sig, 4)
+                result["macd"]["crossover"] = "bullish" if tv_macd > tv_sig else "bearish"
+
+            ma_dict = result["moving_averages"]
+            if "SMA20" in tv_ind and tv_ind["SMA20"]: ma_dict["sma_20"] = round(float(tv_ind["SMA20"]), 2)
+            if "SMA50" in tv_ind and tv_ind["SMA50"]: ma_dict["sma_50"] = round(float(tv_ind["SMA50"]), 2)
+            if "SMA200" in tv_ind and tv_ind["SMA200"]: ma_dict["sma_200"] = round(float(tv_ind["SMA200"]), 2)
+            if "EMA12" in tv_ind and tv_ind["EMA12"]: ma_dict["ema_12"] = round(float(tv_ind["EMA12"]), 2)
+            if "EMA26" in tv_ind and tv_ind["EMA26"]: ma_dict["ema_26"] = round(float(tv_ind["EMA26"]), 2)
+
+            bb_dict = result["bollinger_bands"]
+            if "BB.upper" in tv_ind and tv_ind["BB.upper"]: bb_dict["upper"] = round(float(tv_ind["BB.upper"]), 2)
+            if "BB.lower" in tv_ind and tv_ind["BB.lower"]: bb_dict["lower"] = round(float(tv_ind["BB.lower"]), 2)
+
+    return result
 
 
 def _rsi_signal(rsi: Optional[float]) -> str:

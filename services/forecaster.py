@@ -19,12 +19,24 @@ DISCLAIMER = (
 )
 
 
-def generate_forecast(df: pd.DataFrame, days: int = 14) -> Dict[str, Any]:
-    """Generate 14-day price forecast using Linear Regression + optional ARIMA."""
+def generate_forecast(df: pd.DataFrame, days: int = 14, latest_price: float = None) -> Dict[str, Any]:
+    """Generate 14-day price forecast using Linear Regression + optional ARIMA.
+    If latest_price is provided (e.g. from a live TradingView quote), it is
+    appended to the close series so the model incorporates the most recent tick.
+    """
     if df is None or df.empty or len(df) < 30:
         return {"error": "Insufficient historical data for forecasting", "disclaimer": DISCLAIMER}
 
     close = df["Close"].dropna()
+
+    # ── Inject latest live price into the series ──
+    if latest_price is not None:
+        now_ts = pd.Timestamp.now()
+        # Only append if the latest price differs from the last entry
+        if abs(close.iloc[-1] - latest_price) > 0.005:
+            live_point = pd.Series([latest_price], index=[now_ts], name="Close")
+            close = pd.concat([close, live_point])
+
     dates = [str(d.date()) if hasattr(d, "date") else str(d) for d in close.index]
 
     # ── Linear Regression Forecast ────────────
@@ -46,14 +58,23 @@ def generate_forecast(df: pd.DataFrame, days: int = 14) -> Dict[str, Any]:
     upper_95 = primary["upper"][-1] if primary.get("upper") else round(proj_p * 1.03, 2)
     lower_95 = primary["lower"][-1] if primary.get("lower") else round(proj_p * 0.97, 2)
 
+    # ── Derive ARIMA statistics dynamically ───
+    aic_val = primary.get("aic", None)
+    rmse_val = primary.get("rmse", None)
+    drift_val = primary.get("drift_term", None)
+    p_val = primary.get("p_value", None)
+    order_str = primary.get("order", "(1,1,0)")
+    econ_spec = primary.get("econometric_specification", None)
+    method_str = f"ARIMA {order_str}" if arima_forecast else "Linear Regression"
+
     return {
-        "method": "ARIMA (2,1,2)" if arima_forecast else "Linear Regression",
-        "order": "(2,1,2)" if arima_forecast else "(1,1,0)",
-        "econometric_specification": "ΔY_t = 0.04 + 0.42ΔY_{t-1} - 0.18ΔY_{t-2} + 0.31ε_{t-1} + 0.12ε_{t-2}",
-        "aic_score": primary.get("aic", 842.10),
-        "rmse": 2.14,
-        "drift_term": "+0.04$/day",
-        "p_value": "< 0.01 (Stationary)",
+        "method": method_str,
+        "order": order_str,
+        "econometric_specification": econ_spec,
+        "aic_score": aic_val,
+        "rmse": rmse_val,
+        "drift_term": drift_val,
+        "p_value": p_val,
         "confidence_corridor": {
             "lower_95": lower_95,
             "spot": current_p,
@@ -112,11 +133,14 @@ def _linear_regression_forecast(close: pd.Series, days: int) -> Dict[str, Any]:
 
 
 def _arima_forecast(close: pd.Series, days: int) -> Optional[Dict[str, Any]]:
-    """ARIMA(2,1,2) forecast — best-effort, fails gracefully."""
+    """ARIMA(2,1,2) forecast — best-effort, fails gracefully.
+    Returns computed model statistics (AIC, RMSE, drift, p-value, econometric spec)."""
     try:
         from statsmodels.tsa.arima.model import ARIMA
+        from statsmodels.tsa.stattools import adfuller
         data = close.tail(120).values
-        model = ARIMA(data, order=(2, 1, 2))
+        order = (2, 1, 2)
+        model = ARIMA(data, order=order)
         result = model.fit()
         forecast_obj = result.get_forecast(steps=days)
         mean_forecast = forecast_obj.predicted_mean
@@ -124,12 +148,67 @@ def _arima_forecast(close: pd.Series, days: int) -> Optional[Dict[str, Any]]:
 
         forecast_dates = _future_dates(close.index[-1], days)
 
+        # ── Compute actual statistics from fitted model ──
+        # RMSE from residuals
+        residuals = result.resid
+        rmse = round(float(np.sqrt(np.mean(residuals ** 2))), 2)
+
+        # Drift term (mean daily change from the forecast)
+        if len(mean_forecast) >= 2:
+            avg_daily_change = (mean_forecast[-1] - float(data[-1])) / days
+            drift_str = f"{'+' if avg_daily_change >= 0 else ''}{avg_daily_change:.2f}$/day"
+        else:
+            drift_str = "+0.00$/day"
+
+        # ADF test for stationarity p-value on differenced series
+        try:
+            diff_data = np.diff(data)
+            adf_result = adfuller(diff_data, maxlag=5)
+            adf_pval = adf_result[1]
+            p_val_str = f"{adf_pval:.4f} ({'Stationary' if adf_pval < 0.05 else 'Non-Stationary'})"
+        except Exception:
+            p_val_str = "N/A"
+
+        # Econometric specification from fitted parameters
+        params = result.params
+        order_str = f"({order[0]},{order[1]},{order[2]})"
+        try:
+            spec_parts = []
+            # Intercept / const
+            if "const" in result.param_names:
+                const_idx = list(result.param_names).index("const")
+                spec_parts.append(f"{params[const_idx]:.2f}")
+            # AR terms
+            for i in range(order[0]):
+                key = f"ar.L{i+1}"
+                if key in result.param_names:
+                    idx = list(result.param_names).index(key)
+                    coef = params[idx]
+                    sign = "+" if coef >= 0 else "-"
+                    spec_parts.append(f"{sign} {abs(coef):.2f}ΔY_{{t-{i+1}}}")
+            # MA terms
+            for i in range(order[2]):
+                key = f"ma.L{i+1}"
+                if key in result.param_names:
+                    idx = list(result.param_names).index(key)
+                    coef = params[idx]
+                    sign = "+" if coef >= 0 else "-"
+                    spec_parts.append(f"{sign} {abs(coef):.2f}ε_{{t-{i+1}}}")
+            econ_spec = "ΔY_t = " + " ".join(spec_parts) if spec_parts else None
+        except Exception:
+            econ_spec = None
+
         return {
             "dates": forecast_dates,
             "prices": [round(float(p), 2) for p in mean_forecast],
             "upper": [round(float(p), 2) for p in conf_int[:, 1]],
             "lower": [round(float(p), 2) for p in conf_int[:, 0]],
             "aic": round(float(result.aic), 2),
+            "rmse": rmse,
+            "drift_term": drift_str,
+            "p_value": p_val_str,
+            "order": order_str,
+            "econometric_specification": econ_spec,
             "direction": "up" if mean_forecast[-1] > float(close.iloc[-1]) else "down",
         }
     except Exception as e:

@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 _quote_cache = {}
 _history_cache = {}
 _search_cache = {}
+_tradingview_price_cache = {}  # Cache for TradingView live quotes (30s TTL)
 
 # ── Rate limit / block tracking ───────────────
 _yfinance_blocked_until = 0.0
@@ -106,24 +107,95 @@ def _mark_yfinance_blocked():
     _yfinance_blocked_until = time.time() + 900.0
 
 
+def _quote_tradingview(ticker: str) -> Optional[Dict[str, Any]]:
+    """Fetch real-time quote data from TradingView scanner API (Cboe BZX Real-Time)."""
+    ticker_clean = ticker.upper().strip()
+    try:
+        url = "https://scanner.tradingview.com/america/scan"
+        payload = {
+            "filter": [{"left": "name", "operation": "equal", "right": ticker_clean}],
+            "columns": ["close", "change", "change_abs", "high", "low", "open", "volume", "description"]
+        }
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        resp = requests.post(url, json=payload, headers=headers, timeout=4)
+        
+        if resp.status_code == 200:
+            data = resp.json().get("data", [])
+            if data:
+                d = data[0]
+                symbol_raw = d.get("s", f"NASDAQ:{ticker_clean}")
+                vals = d.get("d", [])
+                
+                if len(vals) >= 8 and vals[0] is not None:
+                    close_price = vals[0]
+                    change_pct = round(vals[1], 2) if vals[1] is not None else 0.0
+                    change = round(vals[2], 2) if vals[2] is not None else 0.0
+                    high_price = vals[3] if vals[3] is not None else close_price
+                    low_price = vals[4] if vals[4] is not None else close_price
+                    open_price = vals[5] if vals[5] is not None else close_price
+                    volume = vals[6] if vals[6] is not None else 0
+                    company_name = vals[7] or get_company_name_for_ticker(ticker_clean)
+                    exchange_name = symbol_raw.split(":")[0] if ":" in symbol_raw else "NASDAQ"
+
+                    return {
+                        "ticker": ticker_clean,
+                        "name": company_name,
+                        "price": round(close_price, 2),
+                        "change": change,
+                        "change_pct": change_pct,
+                        "high": round(high_price, 2),
+                        "low": round(low_price, 2),
+                        "open": round(open_price, 2),
+                        "prev_close": round(close_price - change, 2),
+                        "volume": int(volume),
+                        "timestamp": datetime.utcnow().isoformat() + "Z",
+                        "is_mock": False,
+                        "source": f"TradingView ({exchange_name} Real-Time)",
+                    }
+    except Exception as e:
+        logger.warning(f"TradingView scanner quote failed for {ticker_clean}: {e}")
+    return None
+
+
+def _get_tradingview_price(symbol: str) -> Optional[Dict[str, Any]]:
+    """Return a live TradingView quote if available, cached for 30 seconds.
+    The cache maps the symbol to a tuple (quote_dict, timestamp).
+    """
+    symbol = symbol.upper().strip()
+    cache_entry = _tradingview_price_cache.get(symbol)
+    now = time.time()
+    # If cached and not stale, return cached quote
+    if cache_entry and now - cache_entry[1] < 30:
+        return cache_entry[0]
+    # Otherwise fetch fresh data
+    fresh = _quote_tradingview(symbol)
+    if fresh:
+        _tradingview_price_cache[symbol] = (fresh, now)
+    return fresh
+
+
 def get_quote(ticker: str) -> Dict[str, Any]:
-    """Get live quote data with fallback chain and mock support."""
+    """Get live quote data with fallback chain: TradingView (Real-Time) -> yfinance -> Finnhub -> Mock."""
     ticker = ticker.upper().strip()
     cache_key = f"quote_{ticker}"
     
     if cache_key in _quote_cache:
         cached_val, ts = _quote_cache[cache_key]
-        if time.time() - ts < 30:
+        if time.time() - ts < 15:
             return cached_val
 
-    result = None
+    # 1. Primary: TradingView (Cboe BZX Real-Time)
+    result = _quote_tradingview(ticker)
 
-    if not _check_yfinance_blocked():
+    # 2. Secondary: yfinance
+    if (not result or "error" in result) and not _check_yfinance_blocked():
         result = _quote_yfinance(ticker)
 
+    # 3. Tertiary: Finnhub
     if (not result or "error" in result) and FINNHUB_KEY and FINNHUB_KEY != "YOUR_FINNHUB_KEY_HERE":
         result = _quote_finnhub(ticker)
 
+    # 4. Fallback: Mock Sandbox
     if not result or "error" in result:
         result = _mock_quote(ticker)
 
@@ -131,10 +203,11 @@ def get_quote(ticker: str) -> Dict[str, Any]:
     return result
 
 
-def get_history(ticker: str, period: str = "1M") -> pd.DataFrame:
-    """Get OHLCV history with yfinance and mock fallback."""
+def get_history(ticker: str, period: str = "1M", source: str = "yfinance") -> pd.DataFrame:
+    """Get OHLCV history from yfinance or TradingView real-time anchored data."""
     ticker = ticker.upper().strip()
-    cache_key = f"history_{ticker}_{period}"
+    source = source.lower().strip()
+    cache_key = f"history_{ticker}_{period}_{source}"
     
     if cache_key in _history_cache:
         cached_val, ts = _history_cache[cache_key]
@@ -143,6 +216,49 @@ def get_history(ticker: str, period: str = "1M") -> pd.DataFrame:
 
     df = None
     
+    if source == "tradingview":
+        # 1. Fetch real-time TradingView scanner quote
+        tv_quote = _quote_tradingview(ticker)
+        # 2. Get base history series to construct OHLCV timeline
+        if not _check_yfinance_blocked():
+            yf_period, yf_interval = PERIOD_MAP.get(period, ("1mo", "1d"))
+            try:
+                tk = yf.Ticker(ticker)
+                df = tk.history(period=yf_period, interval=yf_interval, auto_adjust=True)
+            except Exception as e:
+                logger.warning(f"Base history for TradingView failed for {ticker}: {e}")
+        
+        if df is None or df.empty or len(df) < 5:
+            df = _mock_history(ticker, period)
+        else:
+            df.index = pd.to_datetime(df.index)
+
+        # 3. Anchor latest candle / price scale with TradingView quote if valid
+        if tv_quote and "error" not in tv_quote and "price" in tv_quote:
+            try:
+                tv_price = float(tv_quote["price"])
+                tv_open = float(tv_quote.get("open", tv_price))
+                tv_high = float(tv_quote.get("high", max(tv_price, tv_open)))
+                tv_low = float(tv_quote.get("low", min(tv_price, tv_open)))
+                tv_vol = int(tv_quote.get("volume", 0))
+
+                # Update the last bar in the DataFrame with TradingView live numbers
+                df.iloc[-1, df.columns.get_loc("Close")] = tv_price
+                if "Open" in df.columns and tv_open > 0:
+                    df.iloc[-1, df.columns.get_loc("Open")] = tv_open
+                if "High" in df.columns and tv_high > 0:
+                    df.iloc[-1, df.columns.get_loc("High")] = tv_high
+                if "Low" in df.columns and tv_low > 0:
+                    df.iloc[-1, df.columns.get_loc("Low")] = tv_low
+                if "Volume" in df.columns and tv_vol > 0:
+                    df.iloc[-1, df.columns.get_loc("Volume")] = tv_vol
+            except Exception as ex:
+                logger.warning(f"Error anchoring TradingView quote for {ticker}: {ex}")
+
+        _history_cache[cache_key] = (df, time.time())
+        return df
+
+    # Default: yfinance source
     if not _check_yfinance_blocked():
         yf_period, yf_interval = PERIOD_MAP.get(period, ("1mo", "1d"))
         try:
@@ -448,9 +564,15 @@ def _quote_finnhub(ticker: str) -> Optional[Dict[str, Any]]:
 
 
 def _mock_quote(ticker: str) -> Dict[str, Any]:
+    """Fallback quote generator. Attempts cached TradingView first; if unavailable,
+    returns deterministic mock data with fallback metadata for the frontend."""
     ticker = ticker.upper()
+    # First attempt live TradingView via cached helper
+    tv_result = _get_tradingview_price(ticker)
+    if tv_result:
+        return tv_result
+    # Live TradingView unavailable – proceed with mock generation
     base = _get_base_price(ticker)
-    
     random.seed(int(time.time() // 60) + hash(ticker))
     change_pct = random.uniform(-2.5, 2.8)
     price = base * (1 + change_pct / 100)
@@ -473,6 +595,8 @@ def _mock_quote(ticker: str) -> Dict[str, Any]:
         "currency": "USD",
         "exchange": "NASDAQ (MOCK)",
         "source": "Sandbox Mode (Rate Limited / No Key)",
+        "tradingview_unavailable": True,
+        "fallback_options": ["yfinance", "finnhub", "alpha_vantage"],
     }
 
 
@@ -537,12 +661,17 @@ def _mock_history(ticker: str, period: str) -> pd.DataFrame:
 
 
 def get_market_ribbon() -> List[Dict[str, Any]]:
-    """Get market index and trending quotes dynamically for header marquee."""
+    """Get market index and trending quotes dynamically for header marquee, using live TradingView data when possible."""
     symbols = ["AAPL", "TSLA", "NVDA", "MSFT", "GOOGL", "AMZN"]
-    ribbon = [
-        {"symbol": "^GSPC", "label": "S&P 500", "price": 5117.09, "change_pct": 0.42},
-        {"symbol": "^IXIC", "label": "NASDAQ", "price": 16288.36, "change_pct": 0.85},
-    ]
+    ribbon = []
+    # Attempt live TradingView for major indices
+    for idx_symbol, label in [("^GSPC", "S&P 500"), ("^IXIC", "NASDAQ")]:
+        tv = _get_tradingview_price(idx_symbol)
+        if tv and "price" in tv:
+            ribbon.append({"symbol": idx_symbol, "label": label, "price": tv["price"], "change_pct": tv.get("change_pct", 0.0)})
+        else:
+            # fallback static placeholder (will be overridden by cache when available)
+            ribbon.append({"symbol": idx_symbol, "label": label, "price": None, "change_pct": None})
     for sym in symbols:
         q = get_quote(sym)
         if q and "price" in q:

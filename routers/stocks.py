@@ -37,9 +37,13 @@ def company_info(ticker: str):
 
 
 @router.get("/{ticker}/history")
-def history(ticker: str, period: str = Query("1M", pattern="^(1D|1W|1M|3M|1Y|5Y)$")):
-    """Get OHLCV price history."""
-    df = get_history(ticker.upper(), period)
+def history(
+    ticker: str,
+    period: str = Query("1M", pattern="^(1D|1W|1M|3M|1Y|5Y)$"),
+    source: str = Query("yfinance", pattern="^(yfinance|tradingview)$"),
+):
+    """Get OHLCV price history from Yahoo Finance or TradingView."""
+    df = get_history(ticker.upper(), period, source=source)
     if df is None or df.empty:
         raise HTTPException(status_code=404, detail=f"No history data for {ticker}")
 
@@ -56,4 +60,4 @@ def history(ticker: str, period: str = Query("1M", pattern="^(1D|1W|1M|3M|1Y|5Y)
             "volume": int(row.get("Volume", 0)) if row.get("Volume") else 0,
         })
 
-    return {"ticker": ticker.upper(), "period": period, "data": records}
+    return {"ticker": ticker.upper(), "period": period, "source": source, "data": records}

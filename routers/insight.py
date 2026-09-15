@@ -18,6 +18,7 @@ def insight(
     ticker: str,
     risk_profile: str = Query("Moderate", pattern="^(Conservative|Moderate|Aggressive)$"),
     model: str = Query("dual", pattern="^(dual|gpt4o|gemini|claude|deepseek|fingpt|finma|alli)$"),
+    source: str = Query("tradingview", pattern="^(yfinance|tradingview)$"),
 ):
     """
     Generate LLM-synthesized narrative insight and multi-model consensus for a ticker.
@@ -30,19 +31,21 @@ def insight(
     if "error" in quote:
         raise HTTPException(status_code=404, detail=quote["error"])
 
-    df_3m = get_history(ticker, "3M")
-    df_1y = get_history(ticker, "1Y")
+    df_3m = get_history(ticker, "3M", source=source)
+    df_1y = get_history(ticker, "1Y", source=source)
 
     indicators = (
-        get_all_indicators(df_3m)
+        get_all_indicators(df_3m, ticker=ticker, source=source)
         if df_3m is not None and not df_3m.empty
         else {"error": "No data"}
     )
 
     advice = generate_advice(quote, indicators)
 
+    # Pass the latest live price into the forecaster so ARIMA incorporates the most recent tick
+    latest_live_price = quote.get("price")
     forecast = (
-        generate_forecast(df_1y)
+        generate_forecast(df_1y, latest_price=latest_live_price)
         if df_1y is not None and not df_1y.empty
         else {"error": "No data"}
     )
@@ -64,9 +67,12 @@ def insight(
     llm_insight = get_llm_insight(payload, provider=model)
 
     # ── Step 4: Assemble UI data contract ────────────────
-    # ── Step 4: Assemble UI data contract ────────────────
-    price = quote.get("price") or get_quote(ticker.upper()).get("price", 100.0)
-    target_12m = round(price * (1 + (forecast.get("summary", {}).get("projected_change_pct", 5.45) / 100)), 2) if forecast.get("summary") else round(price * 1.0545, 2)
+    price = quote.get("price", 0)
+    projected_change = forecast.get("summary", {}).get("projected_change_pct")
+    if projected_change is not None:
+        target_12m = round(price * (1 + projected_change / 100), 2)
+    else:
+        target_12m = round(price * 1.05, 2)  # modest fallback only if no forecast
     stop_loss = round(price * 0.9451, 2)
     acc_low = round(price * 0.965, 2)
     acc_high = round(price, 2)
@@ -105,16 +111,21 @@ def insight(
     indicators_snapshot = {}
     if "error" not in indicators:
         indicators_snapshot = {
-            "rsi": indicators.get("rsi", {}).get("current", 37.6),
-            "rsi_signal": indicators.get("rsi", {}).get("signal", "OVERSOLD NEAR"),
-            "macd_crossover": indicators.get("macd", {}).get("crossover", "BEARISH"),
-            "trend": indicators.get("trend", "BELOW 50-SMA"),
-            "bb_percent_b": indicators.get("bollinger_bands", {}).get("percent_b", 0.05),
+            "rsi": indicators.get("rsi", {}).get("current"),
+            "rsi_signal": indicators.get("rsi", {}).get("signal"),
+            "macd_crossover": indicators.get("macd", {}).get("crossover"),
+            "trend": indicators.get("trend"),
+            "bb_percent_b": indicators.get("bollinger_bands", {}).get("percent_b"),
             "golden_cross": indicators.get("moving_averages", {}).get("golden_cross"),
-            "sma_50": indicators.get("moving_averages", {}).get("sma_50", 191.11),
-            "sma_250": indicators.get("moving_averages", {}).get("sma_200", 181.40),
-            "vwap": round(price * 0.999, 2),
+            "sma_50": indicators.get("moving_averages", {}).get("sma_50"),
+            "sma_250": indicators.get("moving_averages", {}).get("sma_200"),
+            "vwap": quote.get("price"),  # Use live price instead of hardcoded multiplier
         }
+
+    # ── Detect TradingView unavailability for frontend notification ──
+    data_source = quote.get("source", "")
+    tradingview_unavailable = quote.get("tradingview_unavailable", False)
+    fallback_options = quote.get("fallback_options", [])
 
     return {
         "ticker": ticker,
@@ -123,6 +134,9 @@ def insight(
         "risk_profile": risk_profile,
         "selected_model": model,
         "llm_insight": llm_insight,
+        "data_source": data_source,
+        "tradingview_unavailable": tradingview_unavailable,
+        "fallback_options": fallback_options,
         "consensus": {
             "verdict": verdict,
             "consensus_score": consensus_score,
@@ -148,16 +162,16 @@ def insight(
                 "id": "01",
                 "name": "DATA INGESTION",
                 "subtitle": "Market & Indicator Feed",
-                "details": "OHLCV 250D rolling window, indicator stream",
+                "details": f"OHLCV 250D rolling window, source: {data_source or 'Live Feed'}",
                 "badge": "Synced",
                 "badge_color": "green",
             },
             {
                 "id": "02",
                 "name": "TIME-SERIES PATH",
-                "subtitle": f"ARIMA {forecast.get('order', '(2,1,2)')} Forecaster",
-                "details": f"14D projection, AIC {forecast.get('aic_score', 842.1)}",
-                "badge": "+1.49% Room",
+                "subtitle": f"ARIMA {forecast.get('order', 'N/A')} Forecaster",
+                "details": f"14D projection, AIC {forecast.get('aic_score', 'N/A')}",
+                "badge": f"{'+' if (projected_change or 0) >= 0 else ''}{projected_change or 0:.2f}% Room",
                 "badge_color": "blue",
             },
             {
@@ -179,19 +193,19 @@ def insight(
         ],
         "risk_tags": risk_tags,
         "quote": {
-            "price": quote.get("price", price),
-            "change": quote.get("change", 0.63),
-            "change_pct": quote.get("change_pct", 0.34),
+            "price": quote.get("price"),
+            "change": quote.get("change"),
+            "change_pct": quote.get("change_pct"),
         },
         "indicators_snapshot": indicators_snapshot,
         "forecast_snapshot": {
-            "method": forecast.get("method", "ARIMA (2,1,2)"),
-            "order": forecast.get("order", "(2,1,2)"),
+            "method": forecast.get("method"),
+            "order": forecast.get("order"),
             "econometric_specification": forecast.get("econometric_specification"),
-            "aic_score": forecast.get("aic_score", 842.10),
-            "rmse": forecast.get("rmse", 2.14),
-            "drift_term": forecast.get("drift_term", "+0.04$/day"),
-            "p_value": forecast.get("p_value", "< 0.01 (Stationary)"),
+            "aic_score": forecast.get("aic_score"),
+            "rmse": forecast.get("rmse"),
+            "drift_term": forecast.get("drift_term"),
+            "p_value": forecast.get("p_value"),
             "confidence_corridor": forecast.get("confidence_corridor"),
         },
     }
