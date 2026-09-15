@@ -17,11 +17,11 @@ router = APIRouter()
 def insight(
     ticker: str,
     risk_profile: str = Query("Moderate", pattern="^(Conservative|Moderate|Aggressive)$"),
-    model: str = Query("dual", pattern="^(dual|gpt4o|gemini)$"),
+    model: str = Query("dual", pattern="^(dual|gpt4o|gemini|claude|deepseek|fingpt|finma|alli)$"),
 ):
     """
     Generate LLM-synthesized narrative insight and multi-model consensus for a ticker.
-    Supports dynamic model selection: dual (consensus), gpt4o, or gemini.
+    Supports dynamic model selection: dual, gpt4o, gemini, claude, deepseek, or fingpt.
     """
     ticker = ticker.upper()
 
@@ -61,28 +61,46 @@ def insight(
     )
 
     # ── Step 3: Get LLM insight (or fallback) ────────────
-    llm_insight = get_llm_insight(payload)
+    llm_insight = get_llm_insight(payload, provider=model)
 
     # ── Step 4: Assemble UI data contract ────────────────
+    # ── Step 4: Assemble UI data contract ────────────────
     price = quote.get("price") or get_quote(ticker.upper()).get("price", 100.0)
-    target_12m = round(price * 1.0545, 2)
+    target_12m = round(price * (1 + (forecast.get("summary", {}).get("projected_change_pct", 5.45) / 100)), 2) if forecast.get("summary") else round(price * 1.0545, 2)
     stop_loss = round(price * 0.9451, 2)
     acc_low = round(price * 0.965, 2)
     acc_high = round(price, 2)
 
-    # Dynamic verdict based on selected model
-    if model == "gpt4o":
+    # Dynamic verdict, consensus score, and synthesis thesis directly from LLM output & signals
+    signal_str = advice.get("signal", "HOLD")
+    provider_name = llm_insight.get("provider", "Multi-Model Engine")
+    confidence_val = advice.get("confidence", 75)
+
+    if llm_insight.get("divergence_warning", {}).get("detected"):
+        verdict = f"{signal_str} / SENTIMENT DIVERGENCE"
+    elif signal_str == "BUY":
         verdict = "ACCUMULATE / STAGED BUYS"
-        consensus_score = "OpenAI GPT-4o Engine"
-        synthesis = f"OpenAI GPT-4o recognizes ARIMA mean recovery vector toward ${forecast.get('summary', {}).get('projected_price', 188.40)}; advises staging buys below ${acc_high} prior to testing 50-day SMA overhead resistance."
-    elif model == "gemini":
-        verdict = "CAUTIOUS ACCUMULATION"
-        consensus_score = "Google Gemini 1.5 Pro Engine"
-        synthesis = f"Google Gemini 1.5 Pro highlights MACD histogram cross lag and recommends limiting initial tranches until spot price breaks above the 50-day SMA resistance barrier."
+    elif signal_str == "SELL":
+        verdict = "TRIM / STOP-LOSS"
     else:
         verdict = "HOLD / CAUTIOUS ACCUMULATION"
-        consensus_score = "75% Multi-Model Consensus"
-        synthesis = f"ARIMA models project statistical recovery toward ${forecast.get('summary', {}).get('projected_price', 188.40)} (+1.5%), but multi-model synthesis (GPT-4o & Gemini) identifies technical headwind at the 50-day SMA (${indicators.get('moving_averages', {}).get('sma_50', 191.11)}). Consensus recommends holding current position and accumulating near lower Bollinger support (${indicators.get('bollinger_bands', {}).get('lower', 179.13)})."
+
+    consensus_score = f"{provider_name} ({confidence_val}% Conviction)"
+
+    # Synthesis is dynamically extracted from the LLM summary & trend bullets
+    synthesis = llm_insight.get("summary", "")
+    trend_bullets = llm_insight.get("trend_explanation", [])
+    if trend_bullets:
+        synthesis += f" {trend_bullets[0]}"
+
+    # Risk watchpoints directly from LLM key_risks + quantitative corridor
+    llm_risks = llm_insight.get("key_risks", [])
+    risk_tags = list(llm_risks) if llm_risks else []
+    
+    if forecast.get("confidence_corridor", {}).get("lower_95"):
+        risk_tags.append(f"ARIMA 95% Tail Risk: ${forecast.get('confidence_corridor', {}).get('lower_95')}")
+    if "error" not in indicators and indicators.get("moving_averages", {}).get("sma_50"):
+        risk_tags.append(f"50-Day SMA Resistance (${indicators.get('moving_averages', {}).get('sma_50')})")
 
     indicators_snapshot = {}
     if "error" not in indicators:
@@ -100,8 +118,8 @@ def insight(
 
     return {
         "ticker": ticker,
-        "signal": advice.get("signal", "HOLD"),
-        "confidence": advice.get("confidence", 75),
+        "signal": signal_str,
+        "confidence": confidence_val,
         "risk_profile": risk_profile,
         "selected_model": model,
         "llm_insight": llm_insight,
@@ -111,24 +129,17 @@ def insight(
             "allocation": {"hold": 44, "accumulate": 26, "trim": 30},
             "target_levels": {
                 "accumulation_zone": f"${acc_low} - ${acc_high}",
-                "fair_target_12m": f"${target_12m} (+5.45%)",
+                "fair_target_12m": f"${target_12m}",
                 "stop_loss": f"${stop_loss} (-5.49%)",
             },
             "synthesis_thesis": synthesis,
             "models": {
-                "gpt4o": {
-                    "name": "OpenAI GPT-4o",
-                    "rating": "74% ACCUMULATE",
-                    "thesis": f"Recognizes ARIMA upward vector toward ${forecast.get('summary', {}).get('projected_price', 188.40)}; advises staging buys below ${acc_high} before 50-day SMA resistance.",
-                    "target": f"${round(price * 1.056, 2)}",
-                    "stop": f"${round(price * 0.945, 2)}",
-                },
-                "gemini": {
-                    "name": "Google Gemini 1.5 Pro",
-                    "rating": "76% ACCUMULATE",
-                    "thesis": "Highlights MACD cross lag and recommends limiting initial tranches until spot price tests above 50-day SMA.",
-                    "target": f"${round(price * 1.053, 2)}",
-                    "stop": f"${round(price * 0.944, 2)}",
+                "active_model": {
+                    "name": provider_name,
+                    "rating": f"{confidence_val}% {signal_str}",
+                    "thesis": llm_insight.get("summary", ""),
+                    "target": f"${target_12m}",
+                    "stop": f"${stop_loss}",
                 },
             },
         },
@@ -152,25 +163,21 @@ def insight(
             {
                 "id": "03",
                 "name": "MULTI-LLM REASONING",
-                "subtitle": "GPT-4o & Gemini 1.5 Pro",
-                "details": "Cross-valuation, news sentiment, 50D SMA",
-                "badge": "Accumulate",
+                "subtitle": provider_name,
+                "details": f"Model: {model.upper()} | Dynamic Real-Time Synthesis",
+                "badge": signal_str,
                 "badge_color": "cyan",
             },
             {
                 "id": "04",
                 "name": "RECONCILED OUTPUT",
                 "subtitle": "Executive Conviction",
-                "details": "Consensus Hold / Staged Accumulation",
+                "details": verdict,
                 "badge": "Active Signal",
                 "badge_color": "green",
             },
         ],
-        "risk_tags": [
-            f"ARIMA 95% Tail Risk: ${forecast.get('confidence_corridor', {}).get('lower_95', 181.20)}",
-            f"50-Day SMA Overhead Resistance (${indicators_snapshot.get('sma_50', 191.11)})",
-            "MACD Negative Drift",
-        ],
+        "risk_tags": risk_tags,
         "quote": {
             "price": quote.get("price", price),
             "change": quote.get("change", 0.63),
