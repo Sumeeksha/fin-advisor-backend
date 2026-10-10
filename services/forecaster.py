@@ -50,10 +50,16 @@ def generate_forecast(df: pd.DataFrame, days: int = 14, latest_price: float = No
     history_prices = [round(float(p), 2) for p in close.tail(90)]
 
     # ── Combined forecast ─────────────────────
-    # Use ARIMA if available, else linear regression
-    primary = arima_forecast if arima_forecast else lr_forecast
-
+    # Use ARIMA only if it converged AND its output is sane (no wild spikes)
     current_p = float(close.iloc[-1])
+    if arima_forecast and _is_arima_sane(arima_forecast, current_p):
+        primary = arima_forecast
+    else:
+        if arima_forecast:
+            logger.warning("ARIMA produced erratic forecast (spike >25%%), falling back to Linear Regression.")
+        primary = lr_forecast
+        arima_forecast = None  # force method_str to show Linear Regression
+
     proj_p = primary["prices"][-1] if primary.get("prices") else current_p
     upper_95 = primary["upper"][-1] if primary.get("upper") else round(proj_p * 1.03, 2)
     lower_95 = primary["lower"][-1] if primary.get("lower") else round(proj_p * 0.97, 2)
@@ -66,6 +72,13 @@ def generate_forecast(df: pd.DataFrame, days: int = 14, latest_price: float = No
     order_str = primary.get("order", "(1,1,0)")
     econ_spec = primary.get("econometric_specification", None)
     method_str = f"ARIMA {order_str}" if arima_forecast else "Linear Regression"
+
+    summary_dict = _forecast_summary(close, primary["prices"])
+    if arima_forecast:
+        conf_score = min(99, max(60, int(95 - (rmse_val or 0)*2))) if rmse_val else 89
+    else:
+        conf_score = min(99, max(50, int(lr_forecast.get("r_squared", 0.5) * 100)))
+    summary_dict["autoregressive_confidence"] = conf_score
 
     return {
         "method": method_str,
@@ -91,15 +104,17 @@ def generate_forecast(df: pd.DataFrame, days: int = 14, latest_price: float = No
             "lower_band": primary.get("lower", []),
         },
         "linear_regression": lr_forecast,
-        "summary": _forecast_summary(close, primary["prices"]),
+        "summary": summary_dict,
         "disclaimer": DISCLAIMER,
     }
 
 
 def _linear_regression_forecast(close: pd.Series, days: int) -> Dict[str, Any]:
-    """Simple linear regression on last 90 days."""
+    """Simple linear regression on last 30 days (short-term trend only)."""
     try:
-        data = close.tail(90).values
+        # Use last 30 days — closer to current price, avoids long-term bias
+        data = close.tail(30).values
+        current_price = float(close.iloc[-1])
         x = np.arange(len(data))
         coeffs = np.polyfit(x, data, 1)
         slope, intercept = coeffs[0], coeffs[1]
@@ -108,6 +123,11 @@ def _linear_regression_forecast(close: pd.Series, days: int) -> Dict[str, Any]:
         future_x = np.arange(len(data), len(data) + days)
         predicted = slope * future_x + intercept
 
+        # Cap predictions to ±20% of current price to avoid unrealistic extrapolation
+        cap_upper = current_price * 1.20
+        cap_lower = current_price * 0.80
+        predicted = np.clip(predicted, cap_lower, cap_upper)
+
         # Residuals for confidence bands
         fitted = slope * x + intercept
         residuals = data - fitted
@@ -115,8 +135,8 @@ def _linear_regression_forecast(close: pd.Series, days: int) -> Dict[str, Any]:
 
         forecast_dates = _future_dates(close.index[-1], days)
         prices = [round(float(p), 2) for p in predicted]
-        upper = [round(float(p + 1.96 * std_residual), 2) for p in predicted]
-        lower = [round(float(p - 1.96 * std_residual), 2) for p in predicted]
+        upper = [round(min(float(p + 1.96 * std_residual), cap_upper), 2) for p in predicted]
+        lower = [round(max(float(p - 1.96 * std_residual), cap_lower), 2) for p in predicted]
 
         return {
             "dates": forecast_dates,
@@ -130,6 +150,7 @@ def _linear_regression_forecast(close: pd.Series, days: int) -> Dict[str, Any]:
     except Exception as e:
         logger.warning(f"Linear regression failed: {e}")
         return {}
+
 
 
 def _arima_forecast(close: pd.Series, days: int) -> Optional[Dict[str, Any]]:
@@ -215,8 +236,38 @@ def _arima_forecast(close: pd.Series, days: int) -> Optional[Dict[str, Any]]:
         logger.info(f"ARIMA forecast unavailable (using LR instead): {e}")
         return None
 
+def _is_arima_sane(arima_result: Dict[str, Any], current_price: float, max_total_pct: float = 0.25, max_daily_pct: float = 0.05) -> bool:
+    """Validate ARIMA forecast output. Returns False if:
+    - Any price is NaN or Inf
+    - Total projected change exceeds max_total_pct (default 25%)
+    - Any single day-over-day move exceeds max_daily_pct (default 5%)
+    """
+    prices = arima_result.get("prices", [])
+    if not prices or len(prices) < 2:
+        return False
+    try:
+        for p in prices:
+            if p is None or not np.isfinite(p) or p <= 0:
+                return False
+        # Total move check
+        total_change = abs(prices[-1] - current_price) / current_price
+        if total_change > max_total_pct:
+            return False
+        # Day-over-day spike check (including the first step from current price)
+        all_prices = [current_price] + prices
+        for i in range(1, len(all_prices)):
+            if all_prices[i - 1] == 0:
+                return False
+            daily_move = abs(all_prices[i] - all_prices[i - 1]) / all_prices[i - 1]
+            if daily_move > max_daily_pct:
+                return False
+    except Exception:
+        return False
+    return True
+
 
 def _future_dates(last_date, days: int) -> List[str]:
+
     """Generate future business day dates."""
     dates = []
     current = pd.Timestamp(last_date) + timedelta(days=1)

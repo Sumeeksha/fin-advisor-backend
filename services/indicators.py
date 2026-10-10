@@ -174,6 +174,8 @@ def get_all_indicators(df: pd.DataFrame, ticker: str = "", source: str = "yfinan
             "current": int(current_vol) if current_vol else None,
             "avg_20d": int(avg_vol_20) if avg_vol_20 else None,
             "relative": round(current_vol / avg_vol_20, 2) if current_vol and avg_vol_20 and avg_vol_20 > 0 else None,
+            "buyer_inflow_pct": int(current_rsi) if current_rsi else 50,
+            "seller_outflow_pct": 100 - (int(current_rsi) if current_rsi else 50),
         },
         "trend": trend,
         "current_price": current_price,
@@ -208,6 +210,14 @@ def get_all_indicators(df: pd.DataFrame, ticker: str = "", source: str = "yfinan
             bb_dict = result["bollinger_bands"]
             if "BB.upper" in tv_ind and tv_ind["BB.upper"]: bb_dict["upper"] = round(float(tv_ind["BB.upper"]), 2)
             if "BB.lower" in tv_ind and tv_ind["BB.lower"]: bb_dict["lower"] = round(float(tv_ind["BB.lower"]), 2)
+            if "SMA20" in tv_ind and tv_ind["SMA20"]: bb_dict["middle"] = round(float(tv_ind["SMA20"]), 2)
+            
+            if bb_dict.get("upper") and bb_dict.get("lower") and bb_dict.get("middle"):
+                bb_dict["bandwidth"] = round((bb_dict["upper"] - bb_dict["lower"]) / bb_dict["middle"] * 100, 2)
+                if bb_dict["upper"] != bb_dict["lower"]:
+                    # Try to use TradingView's close price if available, else fallback to the one from yfinance
+                    tv_close = float(tv_ind.get("close", current_price)) if tv_ind.get("close") else current_price
+                    bb_dict["percent_b"] = round((tv_close - bb_dict["lower"]) / (bb_dict["upper"] - bb_dict["lower"]) * 100, 2)
 
     return result
 
