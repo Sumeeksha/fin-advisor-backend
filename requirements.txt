@@ -18,4 +18,12 @@ google-cloud-bigquery==3.45.0
 db-dtypes==1.7.1
 feedparser==6.0.11
 tradingview-ta==3.3.0
-tvdatafeed==2.0.2
+# tvdatafeed==2.0.2
+
+# Multi-Agent & RAG Dependencies
+langgraph==0.1.13
+langchain==0.2.14
+langchain-openai==0.1.22
+chromadb==0.5.5
+sec-api==1.0.18
+beautifulsoup4==4.12.3
